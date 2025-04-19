@@ -38,6 +38,7 @@ static void dequantise(const int64_t *Cq, int n,
 
 static inline float hmax256(__m256 v);
 static void scale_rows_avx(const float *A, int n, float *scale);
+static void scale_rows_avx_unroll(const float *A, int n, float *scale);
 
 /* ===========================================================================*/
 
@@ -66,7 +67,7 @@ int main(int argc, char **argv)
     data_t *scaleA = (data_t *)malloc(n * sizeof(data_t));
     data_t *scaleB = (data_t *)malloc(n * sizeof(data_t));
     // scale_rows(A, n, scaleA);
-    scale_rows_avx(A, n, scaleA);
+    scale_rows_avx_unroll(A, n, scaleA);
     scale_cols(B, n, scaleB);
 
     /* 3.  quantise to INT16 -------------------------------------------------*/
@@ -231,6 +232,39 @@ void scale_rows_avx(const float *A, int n, float *scale)
         }
 
         float max_scalar = hmax256(maxv);          // reduce vector to scalar
+
+        // Handle tail elements (n not divisible by 8)
+        for (; j < n; ++j) {
+            float v = fabsf(row[j]);
+            if (v > max_scalar) max_scalar = v;
+        }
+
+        scale[i] = max_scalar;
+    }
+}
+
+void scale_rows_avx_unroll(const float *A, int n, float *scale)
+{
+    const __m256 signmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+
+    for (int i = 0; i < n; ++i) {
+        const float *row = &A[i * n];
+        __m256 maxv1 = _mm256_setzero_ps();
+        __m256 maxv2 = _mm256_setzero_ps();
+
+        int j = 0;
+        for (; j <= n - 16; j += 16) {
+            __m256 v1 = _mm256_loadu_ps(&row[j]);
+            __m256 v2 = _mm256_loadu_ps(&row[j + 8]);
+            v1 = _mm256_and_ps(v1, signmask);        // fabs
+            v2 = _mm256_and_ps(v2, signmask);        // fabs
+            maxv1 = _mm256_max_ps(maxv1, v1);
+            maxv2 = _mm256_max_ps(maxv2, v2);
+        }
+
+        float max_scalar1 = hmax256(maxv1);          // reduce vector to scalar
+        float max_scalar2 = hmax256(maxv2);          // reduce vector to scalar
+        float max_scalar = max_scalar1 > max_scalar2 ? max_scalar1 : max_scalar2;
 
         // Handle tail elements (n not divisible by 8)
         for (; j < n; ++j) {
