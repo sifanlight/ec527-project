@@ -17,6 +17,16 @@
  * =====================================================*/
 typedef float data_t;        /* change here if you need BF16 / FP64 / etc. */
 
+
+// Structure to hold thread data
+typedef struct {
+    int thread_id;
+    int n;
+    const data_t** A;
+    data_t** scale;
+} thread_data_t;
+#define NUM_THREADS 8
+
 /* Handy macro for row‑major indexing of a flat array */
 #define IDX(i,j,n)  ((i)*(n) + (j))
 
@@ -39,6 +49,8 @@ static void dequantise(const int64_t *Cq, int n,
 static inline float hmax256(__m256 v);
 static void scale_rows_avx(const float *A, int n, float *scale);
 static void scale_rows_avx_unroll(const float *A, int n, float *scale);
+void *scale_rows_avx_unroll_thread_worker(void *arg);
+static void scale_rows_avx_unroll_threadcall(int n, const float *A, float *scale);
 
 /* ===========================================================================*/
 
@@ -67,7 +79,8 @@ int main(int argc, char **argv)
     data_t *scaleA = (data_t *)malloc(n * sizeof(data_t));
     data_t *scaleB = (data_t *)malloc(n * sizeof(data_t));
     // scale_rows(A, n, scaleA);
-    scale_rows_avx_unroll(A, n, scaleA);
+    // scale_rows_avx_unroll(A, n, scaleA);
+    scale_rows_avx_unroll_threadcall(n, A, scaleA);
     scale_cols(B, n, scaleB);
 
     /* 3.  quantise to INT16 -------------------------------------------------*/
@@ -273,5 +286,70 @@ void scale_rows_avx_unroll(const float *A, int n, float *scale)
         }
 
         scale[i] = max_scalar;
+    }
+}
+
+
+void *scale_rows_avx_unroll_thread_worker(void *arg)
+{
+    const __m256 signmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    thread_data_t *data = (thread_data_t *)arg;
+    int n = data->n;
+    const float *A = *(data->A);
+    float *scale = *(data->scale);
+    int thread_id = data->thread_id;
+    int rows_per_thread = n / NUM_THREADS;
+    int start_row = thread_id * rows_per_thread;
+    int end_row = (thread_id + 1) * rows_per_thread;
+    if (thread_id == NUM_THREADS - 1) {
+        end_row = n; // Last thread handles any remaining rows
+    }
+    printf("Thread %d processing rows %d to %d\n", thread_id, start_row, end_row);
+
+    for (int i = start_row; i < end_row; ++i) {
+        const float *row = &A[i * n];
+        __m256 maxv1 = _mm256_setzero_ps();
+        __m256 maxv2 = _mm256_setzero_ps();
+
+        int j = 0;
+        for (; j <= n - 16; j += 16) {
+            __m256 v1 = _mm256_loadu_ps(&row[j]);
+            __m256 v2 = _mm256_loadu_ps(&row[j + 8]);
+            v1 = _mm256_and_ps(v1, signmask);        // fabs
+            v2 = _mm256_and_ps(v2, signmask);        // fabs
+            maxv1 = _mm256_max_ps(maxv1, v1);
+            maxv2 = _mm256_max_ps(maxv2, v2);
+        }
+
+        float max_scalar1 = hmax256(maxv1);          // reduce vector to scalar
+        float max_scalar2 = hmax256(maxv2);          // reduce vector to scalar
+        float max_scalar = max_scalar1 > max_scalar2 ? max_scalar1 : max_scalar2;
+
+        // Handle tail elements (n not divisible by 8)
+        for (; j < n; ++j) {
+            float v = fabsf(row[j]);
+            if (v > max_scalar) max_scalar = v;
+        }
+
+        scale[i] = max_scalar;
+    }
+    pthread_exit(NULL);
+}
+
+void scale_rows_avx_unroll_threadcall(int n, const float *A, float *scale)
+{
+    pthread_t threads[NUM_THREADS];
+    thread_data_t thread_data[NUM_THREADS];
+
+    for (int i = 0; i < NUM_THREADS; i++) {
+        thread_data[i].thread_id = i;
+        thread_data[i].n = n;
+        thread_data[i].A = &A;
+        thread_data[i].scale = &scale;
+        pthread_create(&threads[i], NULL, scale_rows_avx_unroll_thread_worker, (void *)&thread_data[i]);
+    }
+
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], NULL);
     }
 }
