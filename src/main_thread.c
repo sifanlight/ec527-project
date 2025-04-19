@@ -36,6 +36,9 @@ static void dequantise(const int64_t *Cq, int n,
                        data_t *C);
                        
 
+static inline float hmax256(__m256 v);
+static void scale_rows_avx(const float *A, int n, float *scale);
+
 /* ===========================================================================*/
 
 int main(int argc, char **argv)
@@ -47,7 +50,7 @@ int main(int argc, char **argv)
     const int n = atoi(argv[1]);
     if (n <= 0) { fputs("arrLen must be positive.\n", stderr); return 1; }
 
-    srand((unsigned)time(NULL));
+    // srand((unsigned)time(NULL));
 
     /* 1.  allocate & fill FP32 input matrices ------------------------------*/
     // data_t *A = alloc_matrix(n);
@@ -62,7 +65,8 @@ int main(int argc, char **argv)
     /* 2.  gather row/column scale factors ---------------------------------*/
     data_t *scaleA = (data_t *)malloc(n * sizeof(data_t));
     data_t *scaleB = (data_t *)malloc(n * sizeof(data_t));
-    scale_rows(A, n, scaleA);
+    // scale_rows(A, n, scaleA);
+    scale_rows_avx(A, n, scaleA);
     scale_cols(B, n, scaleB);
 
     /* 3.  quantise to INT16 -------------------------------------------------*/
@@ -111,6 +115,7 @@ static void alloc_matrix(int n, data_t** m)
 
 static void init_random(data_t *m, int n)
 {
+    srand(123);
     for (int i = 0; i < n * n; ++i)
         m[i] = ((data_t)rand() / RAND_MAX) * 2.0f - 1.0f;   /* (‑1, 1) */
         // m[i] = (data_t)1;
@@ -197,7 +202,42 @@ static void dequantise(const int64_t *Cq, int n,
 
 
 /* ===========================================================================*/
-static void scale_rows_avx(const data_t *A, int n, data_t *scale)
-{
+static inline float hmax256(__m256 v) {
+    __m128 hi = _mm256_extractf128_ps(v, 1); // high 128
+    __m128 lo = _mm256_castps256_ps128(v);   // low 128
+    __m128 max128 = _mm_max_ps(lo, hi);      // max across halves
 
+    // Reduce within 128-bit lane
+    __m128 shuf = _mm_movehdup_ps(max128);   // (1,1,3,3)
+    __m128 max2 = _mm_max_ps(max128, shuf);
+    shuf = _mm_movehl_ps(shuf, max2);
+    __m128 max4 = _mm_max_ss(max2, shuf);
+    return _mm_cvtss_f32(max4);
+}
+
+void scale_rows_avx(const float *A, int n, float *scale)
+{
+    const __m256 signmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+
+    for (int i = 0; i < n; ++i) {
+        const float *row = &A[i * n];
+        __m256 maxv = _mm256_setzero_ps();
+
+        int j = 0;
+        for (; j <= n - 8; j += 8) {
+            __m256 v = _mm256_loadu_ps(&row[j]);
+            v = _mm256_and_ps(v, signmask);        // fabs
+            maxv = _mm256_max_ps(maxv, v);
+        }
+
+        float max_scalar = hmax256(maxv);          // reduce vector to scalar
+
+        // Handle tail elements (n not divisible by 8)
+        for (; j < n; ++j) {
+            float v = fabsf(row[j]);
+            if (v > max_scalar) max_scalar = v;
+        }
+
+        scale[i] = max_scalar;
+    }
 }

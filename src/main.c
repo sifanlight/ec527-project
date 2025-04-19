@@ -42,7 +42,7 @@ int main(int argc, char **argv)
     const int n = atoi(argv[1]);
     if (n <= 0) { fputs("arrLen must be positive.\n", stderr); return 1; }
 
-    srand((unsigned)time(NULL));
+    // srand((unsigned)time(NULL));
 
     /* 1.  allocate & fill FP32 input matrices ------------------------------*/
     data_t *A = alloc_matrix(n);

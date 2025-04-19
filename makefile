@@ -4,7 +4,7 @@
 
 # ---- user‑configurable -----------------------------------
 CC       := gcc
-CFLAGS   := -std=c99 -Wall -Wextra -O3
+CFLAGS   := -std=c99 -Wall -Wextra -O3 -mavx2
 LDFLAGS  := -lm
 TARGETS  := quant_matmul quant_matmul_thread
 SRCDIR   := src
