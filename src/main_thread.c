@@ -58,6 +58,12 @@ static void fp32_to_int16_avx(const float *M, int n,
                               int row_or_col,
                               int16_t *out);
 
+static void fp32_to_int16_avx_unroll(const float *M, int n,
+                                      const float *row_scale,
+                                      const float *col_scale,
+                                      int row_or_col,
+                                      int16_t *out);
+
 
 
 /* ===========================================================================*/
@@ -106,7 +112,7 @@ int main(int argc, char **argv)
         perror("posix_memalign");
         exit(EXIT_FAILURE);
     }
-    fp32_to_int16_avx(A, n, scaleA, NULL, 0, Aq);   /* row‑wise */
+    fp32_to_int16_avx_unroll(A, n, scaleA, NULL, 0, Aq);   /* row‑wise */
     fp32_to_int16_avx(B, n, NULL, scaleB, 1, Bq);   /* col‑wise */
 
     /* 4.  INT16 matmul with INT64 output -----------------------------------*/
@@ -451,10 +457,10 @@ static void fp32_to_int16_avx(const float *M, int n,
 }
 
 static void fp32_to_int16_avx_unroll(const float *M, int n,
-                              const float *row_scale,
-                              const float *col_scale,
-                              int row_or_col,
-                              int16_t *out)
+                                   const float *row_scale,
+                                   const float *col_scale,
+                                   int row_or_col,
+                                   int16_t *out)
 {
     const float qmax = (float)INT16_MAX;
     __m256 qmax_vec = _mm256_set1_ps(qmax);
@@ -463,30 +469,50 @@ static void fp32_to_int16_avx_unroll(const float *M, int n,
         // Row-wise
         for (int i = 0; i < n; ++i) {
             __m256 scale_vec = _mm256_set1_ps(row_scale[i]);
-            for (int j = 0; j < n; j += 8) {
-                __m256 m_vec = _mm256_loadu_ps(&M[IDX(i, j, n)]);
-                __m256 norm = _mm256_div_ps(m_vec, scale_vec);
-                __m256 scaled = _mm256_mul_ps(norm, qmax_vec);
-                __m256i rounded = _mm256_cvtps_epi32(scaled);
 
-                // Pack to int16 (only lower 128-bit available for _mm256_packs_epi32)
-                __m128i lo = _mm256_castsi256_si128(rounded);
-                __m128i hi = _mm256_extracti128_si256(rounded, 1);
-                __m128i packed = _mm_packs_epi32(lo, hi); // 8 x int16_t
+            int j;
+            for (j = 0; j <= n - 16; j += 16) {
+                __m256 m_vec1 = _mm256_loadu_ps(&M[IDX(i, j, n)]);
+                __m256 m_vec2 = _mm256_loadu_ps(&M[IDX(i, j + 8, n)]);
+                __m256 norm1 = _mm256_div_ps(m_vec1, scale_vec);
+                __m256 norm2 = _mm256_div_ps(m_vec2, scale_vec);
+                __m256 scaled1 = _mm256_mul_ps(norm1, qmax_vec);
+                __m256 scaled2 = _mm256_mul_ps(norm2, qmax_vec);
+                __m256i rounded1 = _mm256_cvtps_epi32(scaled1);
+                __m256i rounded2 = _mm256_cvtps_epi32(scaled2);
 
-                _mm_storeu_si128((__m128i*)&out[IDX(i, j, n)], packed);
+                __m128i lo1 = _mm256_castsi256_si128(rounded1);
+                __m128i lo2 = _mm256_castsi256_si128(rounded2);
+                __m128i hi1 = _mm256_extracti128_si256(rounded1, 1);
+                __m128i hi2 = _mm256_extracti128_si256(rounded2, 1);
+                __m128i packed1 = _mm_packs_epi32(lo1, hi1);
+                __m128i packed2 = _mm_packs_epi32(lo2, hi2);
+
+                _mm_storeu_si128((__m128i*)&out[IDX(i, j, n)], packed1);
+                _mm_storeu_si128((__m128i*)&out[IDX(i, j + 8, n)], packed2);
             }
+
+            // Tail loop
+            for (; j < n; ++j) {
+                float val = M[IDX(i, j, n)];
+                float norm = (val / row_scale[i]) * qmax;
+                out[IDX(i, j, n)] = (int16_t)lroundf(norm);
+            }
+            // printf("%d \n", out[IDX(i, 0, n)]);
         }
+
     } else {
         // Column-wise
         for (int j = 0; j < n; ++j) {
             __m256 scale_vec = _mm256_set1_ps(col_scale[j]);
-            for (int i = 0; i < n; i += 8) {
-                __m256 m_vec;
-                for (int k = 0; k < 8; ++k) {
-                    ((float*)&m_vec)[k] = M[IDX(i + k, j, n)];
-                }
 
+            int i;
+            for (i = 0; i <= n - 8; i += 8) {
+                float vals[8];
+                for (int k = 0; k < 8; ++k)
+                    vals[k] = M[IDX(i + k, j, n)];
+
+                __m256 m_vec = _mm256_loadu_ps(vals);
                 __m256 norm = _mm256_div_ps(m_vec, scale_vec);
                 __m256 scaled = _mm256_mul_ps(norm, qmax_vec);
                 __m256i rounded = _mm256_cvtps_epi32(scaled);
@@ -495,10 +521,17 @@ static void fp32_to_int16_avx_unroll(const float *M, int n,
                 __m128i hi = _mm256_extracti128_si256(rounded, 1);
                 __m128i packed = _mm_packs_epi32(lo, hi);
 
-                for (int k = 0; k < 8; ++k) {
+                for (int k = 0; k < 8; ++k)
                     out[IDX(i + k, j, n)] = ((int16_t*)&packed)[k];
-                }
             }
+
+            // Tail loop
+            for (; i < n; ++i) {
+                float val = M[IDX(i, j, n)];
+                float norm = (val / col_scale[j]) * qmax;
+                out[IDX(i, j, n)] = (int16_t)lroundf(norm);
+            }
+          
         }
     }
 }
