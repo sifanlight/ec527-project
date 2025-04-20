@@ -52,6 +52,14 @@ static void scale_rows_avx_unroll(const float *A, int n, float *scale);
 void *scale_rows_avx_unroll_thread_worker(void *arg);
 static void scale_rows_avx_unroll_threadcall(int n, const float *A, float *scale);
 
+static void fp32_to_int16_avx(const float *M, int n,
+                              const float *row_scale,
+                              const float *col_scale,
+                              int row_or_col,
+                              int16_t *out);
+
+
+
 /* ===========================================================================*/
 
 int main(int argc, char **argv)
@@ -84,10 +92,22 @@ int main(int argc, char **argv)
     scale_cols(B, n, scaleB);
 
     /* 3.  quantise to INT16 -------------------------------------------------*/
-    int16_t *Aq = (int16_t *)malloc((size_t)n * n * sizeof(int16_t));
-    int16_t *Bq = (int16_t *)malloc((size_t)n * n * sizeof(int16_t));
-    fp32_to_int16(A, n, scaleA, NULL, 0, Aq);   /* row‑wise */
-    fp32_to_int16(B, n, NULL, scaleB, 1, Bq);   /* col‑wise */
+    // int16_t *Aq = (int16_t *)malloc((size_t)n * n * sizeof(int16_t));
+    // int16_t *Bq = (int16_t *)malloc((size_t)n * n * sizeof(int16_t));
+    int16_t *Aq;
+    int16_t *Bq;
+    int ok = posix_memalign((void **)&Aq, 64, (size_t)n * n * sizeof(int16_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
+    ok = posix_memalign((void **)&Bq, 64, (size_t)n * n * sizeof(int16_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
+    fp32_to_int16_avx(A, n, scaleA, NULL, 0, Aq);   /* row‑wise */
+    fp32_to_int16_avx(B, n, NULL, scaleB, 1, Bq);   /* col‑wise */
 
     /* 4.  INT16 matmul with INT64 output -----------------------------------*/
     int64_t *Cq = (int64_t *)malloc((size_t)n * n * sizeof(int64_t));
@@ -304,7 +324,7 @@ void *scale_rows_avx_unroll_thread_worker(void *arg)
     if (thread_id == NUM_THREADS - 1) {
         end_row = n; // Last thread handles any remaining rows
     }
-    printf("Thread %d processing rows %d to %d\n", thread_id, start_row, end_row);
+    // printf("Thread %d processing rows %d to %d\n", thread_id, start_row, end_row);
 
     for (int i = start_row; i < end_row; ++i) {
         const float *row = &A[i * n];
@@ -351,5 +371,60 @@ void scale_rows_avx_unroll_threadcall(int n, const float *A, float *scale)
 
     for (int i = 0; i < NUM_THREADS; i++) {
         pthread_join(threads[i], NULL);
+    }
+}
+
+
+
+static void fp32_to_int16_avx(const float *M, int n,
+                              const float *row_scale,
+                              const float *col_scale,
+                              int row_or_col,
+                              int16_t *out)
+{
+    const float qmax = (float)INT16_MAX;
+    __m256 qmax_vec = _mm256_set1_ps(qmax);
+
+    if (row_or_col == 0) {
+        // Row-wise
+        for (int i = 0; i < n; ++i) {
+            __m256 scale_vec = _mm256_set1_ps(row_scale[i]);
+            for (int j = 0; j < n; j += 8) {
+                __m256 m_vec = _mm256_loadu_ps(&M[IDX(i, j, n)]);
+                __m256 norm = _mm256_div_ps(m_vec, scale_vec);
+                __m256 scaled = _mm256_mul_ps(norm, qmax_vec);
+                __m256i rounded = _mm256_cvtps_epi32(scaled);
+
+                // Pack to int16 (only lower 128-bit available for _mm256_packs_epi32)
+                __m128i lo = _mm256_castsi256_si128(rounded);
+                __m128i hi = _mm256_extracti128_si256(rounded, 1);
+                __m128i packed = _mm_packs_epi32(lo, hi); // 8 x int16_t
+
+                _mm_storeu_si128((__m128i*)&out[IDX(i, j, n)], packed);
+            }
+        }
+    } else {
+        // Column-wise
+        for (int j = 0; j < n; ++j) {
+            __m256 scale_vec = _mm256_set1_ps(col_scale[j]);
+            for (int i = 0; i < n; i += 8) {
+                __m256 m_vec;
+                for (int k = 0; k < 8; ++k) {
+                    ((float*)&m_vec)[k] = M[IDX(i + k, j, n)];
+                }
+
+                __m256 norm = _mm256_div_ps(m_vec, scale_vec);
+                __m256 scaled = _mm256_mul_ps(norm, qmax_vec);
+                __m256i rounded = _mm256_cvtps_epi32(scaled);
+
+                __m128i lo = _mm256_castsi256_si128(rounded);
+                __m128i hi = _mm256_extracti128_si256(rounded, 1);
+                __m128i packed = _mm_packs_epi32(lo, hi);
+
+                for (int k = 0; k < 8; ++k) {
+                    out[IDX(i + k, j, n)] = ((int16_t*)&packed)[k];
+                }
+            }
+        }
     }
 }
