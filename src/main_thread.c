@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+#include <limits.h>
 #include <time.h>
 #include <assert.h>
 #include <xmmintrin.h>
@@ -41,7 +42,16 @@ typedef struct {
     const int16_t** B;
     int64_t** C;
 } thread_data_t3;
-#define NUM_THREADS 8
+typedef struct {
+    int thread_id;
+    int n;
+    const int64_t** Cq;
+    const data_t** scaleA;
+    const data_t** scaleB;
+    data_t** C;
+} thread_data_t4;
+
+#define NUM_THREADS 32
 
 /* Handy macro for row‑major indexing of a flat array */
 #define IDX(i,j,n)  ((i)*(n) + (j))
@@ -93,6 +103,14 @@ static void matmul_int16_avx_unroll(const int16_t *A,
 
 static void matmul_int16_avx_unroll_threadcall(int n, const int16_t *A, const int16_t *B, int64_t *C);
 void *matmul_int16_avx_unroll_thread_worker(void *arg);
+static void dequantise_avx(const int64_t *Cq, int n,
+                       const data_t *scaleA, const data_t *scaleB,
+                       data_t *C);
+static void dequantise_avx_unroll(const int64_t *Cq, int n,
+                       const data_t *scaleA, const data_t *scaleB,
+                       data_t *C);
+static void dequantise_avx_unroll_threadcall(int n, const int64_t *Cq, const data_t *scaleA, const data_t *scaleB, data_t *C);
+void *dequantise_avx_unroll_thread_worker(void *arg);
 
 
 /* ===========================================================================*/
@@ -162,15 +180,17 @@ int main(int argc, char **argv)
     /* 5.  de‑quantise back to FP32 -----------------------------------------*/
     data_t *C;
     alloc_matrix(n, &C);
-    dequantise(Cq, n, scaleA, scaleB, C);
+    // dequantise(Cq, n, scaleA, scaleB, C);
+    // dequantise_avx_unroll(Cq, n, scaleA, scaleB, C);
+    dequantise_avx_unroll_threadcall(n, Cq, scaleA, scaleB, C);
 
 
     /* 6.  print result (for debugging) ------------------------------------*/
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j)
-            printf("%8.4f ", C[IDX(i, j, n)]);
-        putchar('\n');
-    }
+    // for (int i = 0; i < n; ++i) {
+    //     for (int j = 0; j < n; ++j)
+    //         printf("%8.4f ", C[IDX(i, j, n)]);
+    //     putchar('\n');
+    // }
     /* 6.  cleanup ----------------------------------------------------------*/
     free(A);  free(B);  free(C);
     free(Aq); free(Bq); free(Cq);
@@ -944,6 +964,165 @@ static void matmul_int16_avx_unroll_threadcall(int n, const int16_t *A, const in
         thread_data[i].B = &B;
         thread_data[i].C = &C;
         pthread_create(&threads[i], NULL, mamtul_int16_avx_unroll_worker, (void *)&thread_data[i]);
+    }
+
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+    }
+}
+
+
+static void dequantise_avx(const int64_t *Cq, int n,
+                           const float *scaleA, const float *scaleB,
+                           float *C)
+{
+    const int16_t qmax = INT16_MAX;
+    const float inv = 1.0f / ((float)qmax * (float)qmax);
+
+    for (int i = 0; i < n; ++i) {
+        const float scaleAinv = scaleA[i] * inv;
+        __m256 scaleAinv_vec = _mm256_set1_ps(scaleAinv);
+
+        int j = 0;
+        for (; j <= n - 8; j += 8) {
+            // Load 8 int64_t values and convert to float manually (no direct AVX2 support)
+            float q_f32_arr[8];
+            for (int k = 0; k < 8; ++k) {
+                q_f32_arr[k] = (float)Cq[i * n + j + k];
+            }
+            __m256 q_f32 = _mm256_loadu_ps(q_f32_arr);
+
+            // Load 8 scaleB values
+            __m256 scaleB_vec = _mm256_loadu_ps(&scaleB[j]);
+
+            // Compute result: C[i][j] = q * scaleB[j] * scaleA[i] * inv
+            __m256 prod = _mm256_mul_ps(q_f32, scaleB_vec);
+            prod = _mm256_mul_ps(prod, scaleAinv_vec);
+
+            // Store result
+            _mm256_storeu_ps(&C[i * n + j], prod);
+        }
+
+        // Scalar tail
+        for (; j < n; ++j) {
+            C[i * n + j] = (float)Cq[i * n + j] * scaleA[i] * scaleB[j] * inv;
+        }
+    }
+}
+
+static void dequantise_avx_unroll(const int64_t *Cq, int n,
+                           const float *scaleA, const float *scaleB,
+                           float *C)
+{
+    const int16_t qmax = INT16_MAX;
+    const float inv = 1.0f / ((float)qmax * (float)qmax);
+
+    for (int i = 0; i < n; ++i) {
+        const float scaleAinv = scaleA[i] * inv;
+        __m256 scaleAinv_vec = _mm256_set1_ps(scaleAinv);
+
+        int j = 0;
+        for (; j <= n - 16; j += 16) {
+            float q_f32_arr0[8], q_f32_arr1[8];
+
+            // Scalar int64_t → float conversion for 16 values
+            for (int k = 0; k < 8; ++k) {
+                q_f32_arr0[k] = (float)Cq[i * n + j + k];
+                q_f32_arr1[k] = (float)Cq[i * n + j + 8 + k];
+            }
+
+            __m256 q_f32_0 = _mm256_loadu_ps(q_f32_arr0);
+            __m256 q_f32_1 = _mm256_loadu_ps(q_f32_arr1);
+
+            __m256 scaleB_0 = _mm256_loadu_ps(&scaleB[j]);
+            __m256 scaleB_1 = _mm256_loadu_ps(&scaleB[j + 8]);
+
+            __m256 prod0 = _mm256_mul_ps(q_f32_0, scaleB_0);
+            prod0 = _mm256_mul_ps(prod0, scaleAinv_vec);
+            _mm256_storeu_ps(&C[i * n + j], prod0);
+
+            __m256 prod1 = _mm256_mul_ps(q_f32_1, scaleB_1);
+            prod1 = _mm256_mul_ps(prod1, scaleAinv_vec);
+            _mm256_storeu_ps(&C[i * n + j + 8], prod1);
+        }
+
+        // Handle tail (less than 16)
+        for (; j < n; ++j) {
+            C[i * n + j] = (float)Cq[i * n + j] * scaleA[i] * scaleB[j] * inv;
+        }
+    }
+}
+
+
+void *dequantise_avx_unroll_worker(void *arg)
+{
+    thread_data_t4 *data = (thread_data_t4 *)arg;
+    int n = data->n;
+    const int64_t *Cq = *(data->Cq);
+    const float *scaleA = *(data->scaleA);
+    const float *scaleB = *(data->scaleB);
+    float *C = *(data->C);
+    int thread_id = data->thread_id;
+    int rows_per_thread = n / NUM_THREADS;
+    int start_row = thread_id * rows_per_thread;
+    int end_row = (thread_id + 1) * rows_per_thread;
+    if (thread_id == NUM_THREADS - 1) {
+        end_row = n; // Last thread handles any remaining rows
+    }
+    // printf("Thread %d processing rows %d to %d\n", thread_id, start_row, end_row);
+    const int16_t qmax = INT16_MAX;
+    const float inv = 1.0f / ((float)qmax * (float)qmax);
+
+    for (int i = 0; i < n; ++i) {
+        const float scaleAinv = scaleA[i] * inv;
+        __m256 scaleAinv_vec = _mm256_set1_ps(scaleAinv);
+
+        int j = 0;
+        for (; j <= n - 16; j += 16) {
+            float q_f32_arr0[8], q_f32_arr1[8];
+
+            // Scalar int64_t → float conversion for 16 values
+            for (int k = 0; k < 8; ++k) {
+                q_f32_arr0[k] = (float)Cq[i * n + j + k];
+                q_f32_arr1[k] = (float)Cq[i * n + j + 8 + k];
+            }
+
+            __m256 q_f32_0 = _mm256_loadu_ps(q_f32_arr0);
+            __m256 q_f32_1 = _mm256_loadu_ps(q_f32_arr1);
+
+            __m256 scaleB_0 = _mm256_loadu_ps(&scaleB[j]);
+            __m256 scaleB_1 = _mm256_loadu_ps(&scaleB[j + 8]);
+
+            __m256 prod0 = _mm256_mul_ps(q_f32_0, scaleB_0);
+            prod0 = _mm256_mul_ps(prod0, scaleAinv_vec);
+            _mm256_storeu_ps(&C[i * n + j], prod0);
+
+            __m256 prod1 = _mm256_mul_ps(q_f32_1, scaleB_1);
+            prod1 = _mm256_mul_ps(prod1, scaleAinv_vec);
+            _mm256_storeu_ps(&C[i * n + j + 8], prod1);
+        }
+
+        // Handle tail (less than 16)
+        for (; j < n; ++j) {
+            C[i * n + j] = (float)Cq[i * n + j] * scaleA[i] * scaleB[j] * inv;
+        }
+    }
+    pthread_exit(NULL);
+}
+
+static void dequantise_avx_unroll_threadcall(int n, const int64_t *Cq, const float *scaleA, const float *scaleB, float *C)
+{
+    pthread_t threads[NUM_THREADS];
+    thread_data_t4 thread_data[NUM_THREADS];
+
+    for (int i = 0; i < NUM_THREADS; i++) {
+        thread_data[i].thread_id = i;
+        thread_data[i].n = n;
+        thread_data[i].Cq = &Cq;
+        thread_data[i].scaleA = &scaleA;
+        thread_data[i].scaleB = &scaleB;
+        thread_data[i].C = &C;
+        pthread_create(&threads[i], NULL, dequantise_avx_unroll_worker, (void *)&thread_data[i]);
     }
 
     for (int i = 0; i < NUM_THREADS; i++) {

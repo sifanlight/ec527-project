@@ -72,11 +72,11 @@ int main(int argc, char **argv)
 
 
     /* 6.  print result (for debugging) ------------------------------------*/
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j)
-            printf("%8.4f ", C[IDX(i, j, n)]);
-        putchar('\n');
-    }
+    // for (int i = 0; i < n; ++i) {
+    //     for (int j = 0; j < n; ++j)
+    //         printf("%8.4f ", C[IDX(i, j, n)]);
+    //     putchar('\n');
+    // }
     /* 6.  cleanup ----------------------------------------------------------*/
     free(A);  free(B);  free(C);
     free(Aq); free(Bq); free(Cq);
