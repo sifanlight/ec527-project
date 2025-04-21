@@ -11,6 +11,7 @@
 #include <smmintrin.h>
 #include <immintrin.h>
 #include <pthread.h>
+#include <string.h>
 
 /* =====================================================
  * 1.  Choose ONE line – e.g. float or double or _Float16
@@ -33,6 +34,13 @@ typedef struct{
     int row_or_col;
     int16_t** out;
 } thread_data_t2;
+typedef struct {
+    int thread_id;
+    int n;
+    const int16_t** A;
+    const int16_t** B;
+    int64_t** C;
+} thread_data_t3;
 #define NUM_THREADS 8
 
 /* Handy macro for row‑major indexing of a flat array */
@@ -74,6 +82,17 @@ static void fp32_to_int16_avx_unroll(const float *M, int n,
 
 static void *fp32_to_int16_thread_worker(void *arg);
 static void fp32_to_int16_threadcall(int n, const float *A, float *scale, int row_or_col, int16_t *out);
+static void matmul_int16_avx(const int16_t *A,
+                              const int16_t *B,
+                              int n,
+                              int64_t *C);
+static void matmul_int16_avx_unroll(const int16_t *A,
+                              const int16_t *B,
+                              int n,
+                              int64_t *C);
+
+static void matmul_int16_avx_unroll_threadcall(int n, const int16_t *A, const int16_t *B, int64_t *C);
+void *matmul_int16_avx_unroll_thread_worker(void *arg);
 
 
 /* ===========================================================================*/
@@ -127,8 +146,18 @@ int main(int argc, char **argv)
     fp32_to_int16_avx(B, n, NULL, scaleB, 1, Bq);   /* col‑wise */
 
     /* 4.  INT16 matmul with INT64 output -----------------------------------*/
-    int64_t *Cq = (int64_t *)malloc((size_t)n * n * sizeof(int64_t));
-    matmul_int16(Aq, Bq, n, Cq);
+    // int64_t *Cq = (int64_t *)malloc((size_t)n * n * sizeof(int64_t));
+    int64_t *Cq;
+    ok = posix_memalign((void **)&Cq, 64, (size_t)n * n * sizeof(int64_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
+    memset(Cq, 0, (size_t)n * n * sizeof(int64_t));
+    // matmul_int16(Aq, Bq, n, Cq);
+    // printf("Begin matmul_int16_avx\n");
+    // matmul_int16_avx_unroll(Aq, Bq, n, Cq);
+    matmul_int16_avx_unroll_threadcall(n, Aq, Bq, Cq);
 
     /* 5.  de‑quantise back to FP32 -----------------------------------------*/
     data_t *C;
@@ -563,7 +592,7 @@ void *fp32_to_int16_thread_worker(void *arg)
     if (thread_id == NUM_THREADS - 1) {
         end_row = n; // Last thread handles any remaining rows
     }
-    printf("Thread %d processing rows %d to %d\n", thread_id, start_row, end_row);
+    // printf("Thread %d processing rows %d to %d\n", thread_id, start_row, end_row);
 
     const float qmax = (float)INT16_MAX;
     __m256 qmax_vec = _mm256_set1_ps(qmax);
@@ -655,6 +684,266 @@ static void fp32_to_int16_threadcall(int n, const float *A, float *scale, int ro
         thread_data[i].row_or_col = row_or_col;
         thread_data[i].out = &out;
         pthread_create(&threads[i], NULL, fp32_to_int16_thread_worker, (void *)&thread_data[i]);
+    }
+
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+    }
+}
+
+#define VEC         8          /* 16 int16 per 256‑bit register */
+#define TILE_IJ     16          /* outer tile size */
+#define TILE_K      16          /* reduction tile size */
+
+
+// Write matmul with AVX2 and block tiling with handling of tail elements
+static void matmul_int16_avx(const int16_t *A,
+                             const int16_t *B,
+                             int             n,
+                             int64_t        *C)
+{
+    /* ---- 1.  Transpose B so each column becomes a contiguous row ---- */
+    // int16_t *Bt = (int16_t *)aligned_alloc(32, (size_t)n * n * sizeof(int16_t));
+    int16_t *Bt;
+    int ok = posix_memalign((void **)&Bt, 64, (size_t)n * n * sizeof(int16_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j)
+            Bt[j * n + i] = B[i * n + j];
+
+    /* ---- 2.  Main triple‑loop ---- */
+    const int PF_DIST = 32;                /* bytes to prefetch ahead (≈½‑cache line) */
+    for (int i = 0; i < n; ++i) {
+        const int16_t *rowA = A + (size_t)i * n;
+        for (int j = 0; j < n; ++j) {
+            const int16_t *colB = Bt + (size_t)j * n;
+
+            __m256i acc0 = _mm256_setzero_si256();   /* 4×int64 lanes 0‑3 */
+            __m256i acc1 = _mm256_setzero_si256();   /* 4×int64 lanes 4‑7 */
+
+            int k = 0;
+            for (; k <= n - 16; k += 16) {
+                /*----- software prefetch for the *next* iteration -----*/
+                _mm_prefetch((const char*)(rowA + k + PF_DIST), _MM_HINT_T0);
+                _mm_prefetch((const char*)(colB + k + PF_DIST), _MM_HINT_T0);
+
+                /* load 16×int16, multiply‑add adjacent pairs → 8×int32 */
+                __m256i a16 = _mm256_loadu_si256((const __m256i*)(rowA + k));
+                __m256i b16 = _mm256_loadu_si256((const __m256i*)(colB + k));
+                __m256i prod32 = _mm256_madd_epi16(a16, b16);   /* (a0*b0 + a1*b1) … */
+
+                /* widen each 128‑bit half to 64‑bit and accumulate */
+                acc0 = _mm256_add_epi64(
+                           acc0,
+                           _mm256_cvtepi32_epi64(
+                               _mm256_castsi256_si128(prod32)));            /* low 128 */
+                acc1 = _mm256_add_epi64(
+                           acc1,
+                           _mm256_cvtepi32_epi64(
+                               _mm256_extracti128_si256(prod32, 1)));       /* high 128 */
+            }
+
+            /* ---- 3.  Horizontal reduction to a single int64 ---- */
+            __m256i sum64_256 = _mm256_add_epi64(acc0, acc1);               /* lanes 0‑7 */
+            __m128i lo128 = _mm256_castsi256_si128(sum64_256);
+            __m128i hi128 = _mm256_extracti128_si256(sum64_256, 1);
+            __m128i pair  = _mm_add_epi64(lo128, hi128);                    /* lanes 0‑3 */
+
+            int64_t total = _mm_cvtsi128_si64(pair) +
+                            _mm_extract_epi64(pair, 1);
+
+            /* ---- 4.  Handle the tail (<16 elements) scalar‑style ---- */
+            for (; k < n; ++k)
+                total += (int64_t)rowA[k] * (int64_t)colB[k];
+
+            C[(size_t)i * n + j] = total;
+        }
+    }
+    free(Bt);
+}
+
+
+static void matmul_int16_avx_unroll(const int16_t *A,
+                             const int16_t *B,
+                             int             n,
+                             int64_t        *C)
+{
+    /* ---- Transpose B for better cache access ---- */
+    int16_t *Bt;
+    if (posix_memalign((void **)&Bt, 32, (size_t)n * n * sizeof(int16_t)) != 0) {
+        perror("posix_memalign failed");
+        exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j)
+            Bt[j * n + i] = B[i * n + j];
+
+    /* ---- Main matrix multiplication with loop unrolling ---- */
+    const int PF_DIST = 64; // 64 bytes ahead prefetching
+    for (int i = 0; i < n; ++i) {
+        const int16_t *rowA = A + (size_t)i * n;
+        for (int j = 0; j < n; ++j) {
+            const int16_t *colB = Bt + (size_t)j * n;
+
+            __m256i acc0 = _mm256_setzero_si256();
+            __m256i acc1 = _mm256_setzero_si256();
+
+            int k = 0;
+            for (; k <= n - 32; k += 32) {
+                _mm_prefetch((const char*)(rowA + k + PF_DIST), _MM_HINT_T0);
+                _mm_prefetch((const char*)(colB + k + PF_DIST), _MM_HINT_T0);
+
+                // Load first 16 elements
+                __m256i a16_0 = _mm256_loadu_si256((const __m256i*)(rowA + k));
+                __m256i b16_0 = _mm256_loadu_si256((const __m256i*)(colB + k));
+                __m256i prod0 = _mm256_madd_epi16(a16_0, b16_0);
+
+                // Load next 16 elements
+                __m256i a16_1 = _mm256_loadu_si256((const __m256i*)(rowA + k + 16));
+                __m256i b16_1 = _mm256_loadu_si256((const __m256i*)(colB + k + 16));
+                __m256i prod1 = _mm256_madd_epi16(a16_1, b16_1);
+
+                // Widen and accumulate prod0
+                acc0 = _mm256_add_epi64(
+                           acc0,
+                           _mm256_cvtepi32_epi64(_mm256_castsi256_si128(prod0)));
+                acc0 = _mm256_add_epi64(
+                           acc0,
+                           _mm256_cvtepi32_epi64(_mm256_extracti128_si256(prod0, 1)));
+
+                // Widen and accumulate prod1
+                acc1 = _mm256_add_epi64(
+                           acc1,
+                           _mm256_cvtepi32_epi64(_mm256_castsi256_si128(prod1)));
+                acc1 = _mm256_add_epi64(
+                           acc1,
+                           _mm256_cvtepi32_epi64(_mm256_extracti128_si256(prod1, 1)));
+            }
+
+            // Horizontal reduction
+            __m256i sum64 = _mm256_add_epi64(acc0, acc1);
+            __m128i lo128 = _mm256_castsi256_si128(sum64);
+            __m128i hi128 = _mm256_extracti128_si256(sum64, 1);
+            __m128i pair = _mm_add_epi64(lo128, hi128);
+
+            int64_t total = _mm_cvtsi128_si64(pair) +
+                            _mm_extract_epi64(pair, 1);
+
+            // Tail loop
+            for (; k < n; ++k)
+                total += (int64_t)rowA[k] * (int64_t)colB[k];
+
+            C[(size_t)i * n + j] = total;
+        }
+    }
+    free(Bt);
+}
+
+
+void *mamtul_int16_avx_unroll_worker(void *arg)
+{
+    thread_data_t3 *data = (thread_data_t3 *)arg;
+    int n = data->n;
+    const int16_t *A = *(data->A);
+    const int16_t *B = *(data->B);
+    int64_t *C = *(data->C);
+    int thread_id = data->thread_id;
+    int rows_per_thread = n / NUM_THREADS;
+    int start_row = thread_id * rows_per_thread;
+    int end_row = (thread_id + 1) * rows_per_thread;
+    if (thread_id == NUM_THREADS - 1) {
+        end_row = n; // Last thread handles any remaining rows
+    }
+    // printf("Thread %d processing rows %d to %d\n", thread_id, start_row, end_row);
+    
+    
+    /* ---- Transpose B for better cache access ---- */
+    int16_t *Bt;
+    if (posix_memalign((void **)&Bt, 32, (size_t)n * n * sizeof(int16_t)) != 0) {
+        perror("posix_memalign failed");
+        exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j)
+            Bt[j * n + i] = B[i * n + j];
+
+    /* ---- Main matrix multiplication with loop unrolling ---- */
+    const int PF_DIST = 64; // 64 bytes ahead prefetching
+    for (int i = start_row; i < end_row; ++i) {
+        const int16_t *rowA = A + (size_t)i * n;
+        for (int j = 0; j < n; ++j) {
+            const int16_t *colB = Bt + (size_t)j * n;
+
+            __m256i acc0 = _mm256_setzero_si256();
+            __m256i acc1 = _mm256_setzero_si256();
+
+            int k = 0;
+            for (; k <= n - 32; k += 32) {
+                _mm_prefetch((const char*)(rowA + k + PF_DIST), _MM_HINT_T0);
+                _mm_prefetch((const char*)(colB + k + PF_DIST), _MM_HINT_T0);
+
+                // Load first 16 elements
+                __m256i a16_0 = _mm256_loadu_si256((const __m256i*)(rowA + k));
+                __m256i b16_0 = _mm256_loadu_si256((const __m256i*)(colB + k));
+                __m256i prod0 = _mm256_madd_epi16(a16_0, b16_0);
+
+                // Load next 16 elements
+                __m256i a16_1 = _mm256_loadu_si256((const __m256i*)(rowA + k + 16));
+                __m256i b16_1 = _mm256_loadu_si256((const __m256i*)(colB + k + 16));
+                __m256i prod1 = _mm256_madd_epi16(a16_1, b16_1);
+
+                // Widen and accumulate prod0
+                acc0 = _mm256_add_epi64(
+                           acc0,
+                           _mm256_cvtepi32_epi64(_mm256_castsi256_si128(prod0)));
+                acc0 = _mm256_add_epi64(
+                           acc0,
+                           _mm256_cvtepi32_epi64(_mm256_extracti128_si256(prod0, 1)));
+
+                // Widen and accumulate prod1
+                acc1 = _mm256_add_epi64(
+                           acc1,
+                           _mm256_cvtepi32_epi64(_mm256_castsi256_si128(prod1)));
+                acc1 = _mm256_add_epi64(
+                           acc1,
+                           _mm256_cvtepi32_epi64(_mm256_extracti128_si256(prod1, 1)));
+            }
+
+            // Horizontal reduction
+            __m256i sum64 = _mm256_add_epi64(acc0, acc1);
+            __m128i lo128 = _mm256_castsi256_si128(sum64);
+            __m128i hi128 = _mm256_extracti128_si256(sum64, 1);
+            __m128i pair = _mm_add_epi64(lo128, hi128);
+
+            int64_t total = _mm_cvtsi128_si64(pair) +
+                            _mm_extract_epi64(pair, 1);
+
+            // Tail loop
+            for (; k < n; ++k)
+                total += (int64_t)rowA[k] * (int64_t)colB[k];
+
+            C[(size_t)i * n + j] = total;
+        }
+    }
+    free(Bt);
+    pthread_exit(NULL);
+}
+
+static void matmul_int16_avx_unroll_threadcall(int n, const int16_t *A, const int16_t *B, int64_t *C)
+{
+    pthread_t threads[NUM_THREADS];
+    thread_data_t3 thread_data[NUM_THREADS];
+
+    for (int i = 0; i < NUM_THREADS; i++) {
+        thread_data[i].thread_id = i;
+        thread_data[i].n = n;
+        thread_data[i].A = &A;
+        thread_data[i].B = &B;
+        thread_data[i].C = &C;
+        pthread_create(&threads[i], NULL, mamtul_int16_avx_unroll_worker, (void *)&thread_data[i]);
     }
 
     for (int i = 0; i < NUM_THREADS; i++) {
