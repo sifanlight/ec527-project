@@ -56,7 +56,7 @@ uint8_t floored_mod_MM(uint32_t a, uint8_t b);
 static void RNS_MMM(const uint8_t *mat_A_3D, const uint8_t *mat_B_3D, 
                      int n,  int m, const uint8_t *moduli_set,
                     uint8_t *res_3D_mat) ;
-int64_t floored_mod_CRT(int128_t a, int128_t b);
+int128_t floored_mod_CRT(int128_t a, int128_t b);
  static void CRT_MMM(const uint8_t *res_MM_3D_mat, int n, int m,
                     int64_t *rns_to_int_mat );
 
@@ -349,8 +349,8 @@ static void RNS_MMM(const uint8_t *mat_A_3D, const uint8_t *mat_B_3D, int n, int
     }
 }
 
-int64_t floored_mod_CRT(int128_t a, int128_t b) {
-    return static_cast<int64_t>( ((a % b) + b) % b);
+int128_t floored_mod_CRT(int128_t a, int128_t b) {
+    return static_cast<int128_t>( ((a % b) + b) % b);
 }
 
 static void CRT_MMM(const uint8_t *res_MM_3D_mat, int n,  int m,
@@ -411,15 +411,15 @@ static void CRT_MMM(const uint8_t *res_MM_3D_mat, int n,  int m,
                 sum += term;
             }
             // Modulo M to wrap around
-            int64_t sum_t = floored_mod_CRT(sum, M);
+            int128_t sum_t = floored_mod_CRT(sum, M);
             if(sum_t<=lambda){
-                sum_t=sum_t;
+                rns_to_int_mat[i*n + j] = static_cast<int64_t>(sum_t);
             }else{
-                sum_t=int64_t(int128_t(sum_t)-M);
+                rns_to_int_mat[i*n + j] = static_cast<int64_t>(sum_t - M);
             }
 
             // Save final result as 64-bit integer (should fit safely)
-            rns_to_int_mat[i*n + j] = sum_t;
+            //rns_to_int_mat[i*n + j] = sum_t;
         }
     }
     
