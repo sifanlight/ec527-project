@@ -6,19 +6,21 @@
 #include <stdint.h>
 #include <math.h>
 #include <time.h>
-#include <iostream>
-#include <fstream>
-#include <cmath> // For std::round
+#include <immintrin.h>
+// #include <iostream>
+// #include <fstream>
+// #include <cmath> // For std::round
 #include <bits/stdc++.h>
 #include <boost/multiprecision/cpp_int.hpp>
-#include <iostream>
+// #include <iostream>
 #include <math.h>
-#include <iostream>
-#include <fstream>
-#include <string>
+// #include <iostream>
+// #include <fstream>
+#include <string.h>
 #include <time.h>
 #include <cmath> // For std::round
 #include <boost/multiprecision/cpp_int.hpp> // For int128_t
+#include <smmintrin.h>
 using namespace boost::multiprecision;
 
 /* =====================================================
@@ -29,7 +31,7 @@ typedef float data_t;        /* change here if you need BF16 / FP64 / etc. */
 /* Handy macro for row‑major indexing of a flat array */
 #define IDX(i,j,n)  ((i)*(n) + (j))
 #define IDX_3D(i,j,k,n)  ((i)*(n) + (j) + k*(n*n))
-static data_t *alloc_matrix(int n);
+static void alloc_matrix(int n, data_t** m);
 static void init_random(data_t *m, int n); 
 static void scale_rows(const data_t *A, int n, data_t *scale);
 static void scale_cols(const data_t *B, int n, data_t *scale);
@@ -60,6 +62,12 @@ int128_t floored_mod_CRT(int128_t a, int128_t b);
  static void CRT_MMM(const uint8_t *res_MM_3D_mat, int n, int m,
                     int64_t *rns_to_int_mat );
 
+static void forward_RNS_avx(const int16_t *mat, int n,
+                        const uint8_t *moduli_set, int m,
+                        uint8_t *res_3D_mat);
+
+static void RNS_MMM_vec(const uint8_t *mat_A_3D, const uint8_t *mat_B_3D,
+                            int n, int m, const uint8_t *moduli_set, uint8_t *res_3D_mat);
 
 
 
@@ -79,61 +87,143 @@ int main(int argc, char **argv)
     srand((unsigned)time(NULL));
 
     /* Moduli set */
-    const uint8_t moduli_set[9] = {254, 253, 251, 249, 247, 245, 241, 239, 233};
-    const int m = 9;  // 9 moduli
+    // const uint8_t moduli_set[8] = {254, 253, 251, 249, 247, 245, 241, 239};//, 233};
+    uint8_t *moduli_set;
+    int ok = posix_memalign((void **)&moduli_set, 32, 8 * sizeof(uint8_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
+    moduli_set[0] = 254; moduli_set[1] = 253; moduli_set[2] = 251;
+    moduli_set[3] = 249; moduli_set[4] = 247; moduli_set[5] = 245;
+    moduli_set[6] = 241; moduli_set[7] = 239;
+    const int m = 8;  // 9 moduli
 
     /* 1. allocate & fill FP32 input matrices ------------------------------ */
-    data_t *A = alloc_matrix(n);
-    data_t *B = alloc_matrix(n);
-    data_t *C_res = alloc_matrix(n);
+    // data_t *A = alloc_matrix(n);
+    // data_t *B = alloc_matrix(n);
+    // data_t *C_res = alloc_matrix(n);
+    data_t *A;
+    data_t *B;
+    data_t *C_res;
+    alloc_matrix(n, &A);
+    alloc_matrix(n, &B);
+    alloc_matrix(n, &C_res);
     init_random(A, n);
     init_random(B, n);
     
     matmul_float(A,B,n,C_res);
       /* 8. print result ------------------------------------------------------ */
-    printf("\n input result:\n");
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j)
-            printf("%8.4f ", C_res[IDX(i, j, n)]);
-        putchar('\n');
-    }
+    // printf("\n input result:\n");
+    // for (int i = 0; i < n; ++i) {
+    //     for (int j = 0; j < n; ++j)
+    //         printf("%8.4f ", C_res[IDX(i, j, n)]);
+    //     putchar('\n');
+    // }
 
     /* 2. scaling factors -------------------------------------------------- */
-    data_t *scaleA = (data_t *)malloc(n * sizeof(data_t));
-    data_t *scaleB = (data_t *)malloc(n * sizeof(data_t));
+    // data_t *scaleA = (data_t *)malloc(n * sizeof(data_t));
+    // data_t *scaleB = (data_t *)malloc(n * sizeof(data_t));
+    data_t *scaleA;
+    data_t *scaleB;
+    // int ok;
+    ok = posix_memalign((void**)&scaleA, 32, n * sizeof(data_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
+    ok = posix_memalign((void**)&scaleB, 32, n * sizeof(data_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
     scale_rows(A, n, scaleA);
     scale_cols(B, n, scaleB);
 
     /* 3. quantise to INT16 ------------------------------------------------ */
-    int16_t *Aq = (int16_t *)malloc((size_t)n * n * sizeof(int16_t));
-    int16_t *Bq = (int16_t *)malloc((size_t)n * n * sizeof(int16_t));
+    // int16_t *Aq = (int16_t *)malloc((size_t)n * n * sizeof(int16_t));
+    // int16_t *Bq = (int16_t *)malloc((size_t)n * n * sizeof(int16_t));
+    int16_t *Aq;
+    int16_t *Bq;
+    ok = posix_memalign((void **)&Aq, 64, (size_t)n * n * sizeof(int16_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
+    ok = posix_memalign((void **)&Bq, 64, (size_t)n * n * sizeof(int16_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
     fp32_to_int16(A, n, scaleA, NULL, 0, Aq);   /* row-wise */
     fp32_to_int16(B, n, NULL, scaleB, 1, Bq);   /* col-wise */
 
     /* 4. forward RNS conversion ------------------------------------------- */
-    uint8_t *Aq_3D = (uint8_t *)malloc((size_t)n * n * m * sizeof(uint8_t));
-    uint8_t *Bq_3D = (uint8_t *)malloc((size_t)n * n * m * sizeof(uint8_t));
-    forward_RNS(Aq, n, moduli_set, m, Aq_3D);
-    forward_RNS(Bq, n, moduli_set, m, Bq_3D);
+    // uint8_t *Aq_3D = (uint8_t *)malloc((size_t)n * n * m * sizeof(uint8_t));
+    // uint8_t *Bq_3D = (uint8_t *)malloc((size_t)n * n * m * sizeof(uint8_t));
+    uint8_t *Aq_3D;
+    uint8_t *Bq_3D;
+    ok = posix_memalign((void **)&Aq_3D, 64, (size_t)n * n * m * sizeof(uint8_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
+    ok = posix_memalign((void **)&Bq_3D, 64, (size_t)n * n * m * sizeof(uint8_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
+    // forward_RNS(Aq, n, moduli_set, m, Aq_3D);
+    // forward_RNS(Bq, n, moduli_set, m, Bq_3D);
+    forward_RNS_avx(Aq, n, moduli_set, m, Aq_3D);
+    forward_RNS_avx(Bq, n, moduli_set, m, Bq_3D);
 
     /* 5. RNS MMM ----------------------------------------------------------- */
-    uint8_t *Cq_3D = (uint8_t *)malloc((size_t)n * n * m * sizeof(uint8_t));
-    RNS_MMM(Aq_3D, Bq_3D, n, m,moduli_set, Cq_3D);
+    // uint8_t *Cq_3D = (uint8_t *)malloc((size_t)n * n * m * sizeof(uint8_t));
+    uint8_t *Cq_3D;
+    ok = posix_memalign((void **)&Cq_3D, 64, (size_t)n * n * m * sizeof(uint8_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
+    RNS_MMM_vec(Aq_3D, Bq_3D, n, m,moduli_set, Cq_3D);
 
     /* 6. CRT reconstruction ------------------------------------------------ */
-    int64_t *Cq = (int64_t *)malloc((size_t)n * n * sizeof(int64_t));
+    // int64_t *Cq = (int64_t *)malloc((size_t)n * n * sizeof(int64_t));
+    int64_t *Cq;
+    ok = posix_memalign((void **)&Cq, 64, (size_t)n * n * sizeof(int64_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
     CRT_MMM(Cq_3D, n, m, Cq);
 
     /* 7. Dequantise -------------------------------------------------------- */
-    data_t *C = alloc_matrix(n);
+    // data_t *C = alloc_matrix(n);
+    data_t *C;
+    ok = posix_memalign((void**)&C, 32, n * n * sizeof(data_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
     dequantise(Cq, n, scaleA, scaleB, C);
 
     /* 8. print result ------------------------------------------------------ */
-    printf("\nResult matrix (after RNS MatMul + CRT + Dequantization):\n");
+    // printf("\nResult matrix (after RNS MatMul + CRT + Dequantization):\n");
+    // for (int i = 0; i < n; ++i) {
+    //     for (int j = 0; j < n; ++j)
+    //         printf("%8.4f ", C[IDX(i, j, n)]);
+    //     putchar('\n');
+    // }
+    /* comparing the result of RNS and normal*/
+    
+    printf("\nComparing the result of RNS and normal multiplication:\n");
     for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j)
-            printf("%8.4f ", C[IDX(i, j, n)]);
-        putchar('\n');
+        for (int j = 0; j < n; ++j) {
+            if (fabs(C[IDX(i, j, n)] - C_res[IDX(i, j, n)]) > 1e-2) {
+                printf("Mismatch at (%d, %d): RNS = %8.4f, Normal = %8.4f\n", i, j, C[IDX(i, j, n)], C_res[IDX(i, j, n)]);
+            }
+        }
     }
 
     /* 9. cleanup ----------------------------------------------------------- */
@@ -150,11 +240,13 @@ int main(int argc, char **argv)
 
 /* ---------- basic utilities ------------------------------------------------*/
 
-static data_t *alloc_matrix(int n)
+static void alloc_matrix(int n, data_t** m)
 {
-    data_t *m = (data_t *)malloc((size_t)n * n * sizeof(data_t));
-    if (!m) { perror("malloc"); exit(EXIT_FAILURE); }
-    return m;
+    int ok = posix_memalign((void **)m, 64, (size_t)n * n * sizeof(data_t));
+    if (ok != 0) {
+        perror("posix_memalign");
+        exit(EXIT_FAILURE);
+    }
 }
 
 static void init_random(data_t *m, int n)
@@ -297,7 +389,7 @@ int128_t modInverse(int128_t A, int128_t M) {
 
 
 /*---------------------------------------------------------------*/
-uint8_t floored_mod_forward(int16_t a, uint8_t b) { // to be used in forward RNS 
+uint8_t inline floored_mod_forward(int16_t a, uint8_t b) { // to be used in forward RNS 
     return static_cast<uint8_t>( ((a % static_cast<int16_t>(b)) + static_cast<int16_t>(b)) % static_cast<int16_t>(b));
 }
 
@@ -321,7 +413,7 @@ static void forward_RNS(const int16_t *mat,int n,       // int n is the size of 
     }
     // res_3D_mat =[8xNxN] --> res_3D_mat[0*(n*n) + 0*n + 0] ,
 }
-uint8_t floored_mod_MM(uint32_t a, uint8_t b) { // to be used in forward RNS 
+uint8_t inline floored_mod_MM(uint32_t a, uint8_t b) { // to be used in forward RNS 
     return static_cast<uint8_t>( ((a % static_cast<uint32_t>(b)) + static_cast<uint32_t>(b)) % static_cast<uint32_t>(b));
 }
 static void RNS_MMM(const uint8_t *mat_A_3D, const uint8_t *mat_B_3D, int n, int m, const uint8_t *moduli_set,uint8_t *res_3D_mat)       //nxnxm matrices where m=size of the moduli set
@@ -368,22 +460,23 @@ static void CRT_MMM(const uint8_t *res_MM_3D_mat, int n,  int m,
 
    
    // Moduli array (your m_i's)
-    const int moduli_set[9] = {254, 253, 251, 249, 247, 245, 241, 239, 233};
+    const int moduli_set[8] = {254, 253, 251, 249, 247, 245, 241, 239};//, 233};
 
     // Precomputed M and M_i values--- declare as constants once calcualting them
-    int128_t M = int128_t(254) * int128_t(253) * int128_t(251) * int128_t(249) * int128_t(247) * int128_t(245) * int128_t(241) * int128_t(239) * int128_t(233);
+    int128_t M = int128_t(254) * int128_t(253) * int128_t(251) * int128_t(249) * int128_t(247) * int128_t(245) * int128_t(241) * int128_t(239) ;//* int128_t(233);
     int128_t lambda= (M-1)/2;
-    int128_t M_i[9];
-    for (int k = 0; k < 9; ++k) {
+    printf("I'm here\n");
+    int128_t M_i[8];
+    for (int k = 0; k < 8; ++k) {
         M_i[k] = 1;
-        for (int l = 0; l < 9; ++l) {
+        for (int l = 0; l < 8; ++l) {
             if (l != k) {
                 M_i[k] *= int128_t(moduli_set[l]);
             }
         }
     }
-    int128_t inv_M_i[9];
-    for (int k = 0; k < 9; ++k) {
+    int128_t inv_M_i[8];
+    for (int k = 0; k < 8; ++k) {
         inv_M_i[k] = modInverse(M_i[k], int128_t(moduli_set[k]));
     }
     /* i will just declare them as constants after calcualting them
@@ -423,4 +516,120 @@ static void CRT_MMM(const uint8_t *res_MM_3D_mat, int n,  int m,
         }
     }
     
+}
+
+// // Vectorized wrapper for floored_mod_forward using scalar fallback
+// inline __m128i floored_mod_forward_vec(__m128i a, __m128i b) {
+//     alignas(16) int16_t a_arr[8], b_arr[8], res_arr[8];
+//     _mm_store_si128((__m128i*)a_arr, a);
+//     _mm_store_si128((__m128i*)b_arr, b);
+
+//     for (int i = 0; i < 8; ++i) {
+//         int16_t aa = a_arr[i];
+//         int16_t bb = b_arr[i];
+//         // Safe floored modulus (always returns positive mod)
+//         int16_t mod = ((aa % bb) + bb) % bb;
+//         res_arr[i] = mod;
+//     }
+
+//     return _mm_load_si128((__m128i*)res_arr);
+// }
+
+
+/// floor-positive modulus element-wise on eight signed 16-bit lanes
+/// r = ((a % b) + b) % b  , with  0 ≤ r < b   (b must be >0, non-zero)
+inline __m128i floored_mod_forward_vec(__m128i a16, __m128i b16)
+{
+    // printf("I'm here\n");
+    // 1. Unpack 8×i16 -> two 4×i32 blocks (sign-extended)
+    __m128i a_lo32 = _mm_cvtepi16_epi32(a16);                    // a[0..3]
+    __m128i b_lo32 = _mm_cvtepi16_epi32(b16);
+    __m128i a_hi32 = _mm_cvtepi16_epi32(_mm_srli_si128(a16, 8)); // a[4..7]
+    __m128i b_hi32 = _mm_cvtepi16_epi32(_mm_srli_si128(b16, 8));
+
+    // 2. Convert to float and compute floor-quotient q = ⎣a / b⎦
+    __m128 q_lo_f = _mm_div_ps(_mm_cvtepi32_ps(a_lo32),
+                               _mm_cvtepi32_ps(b_lo32));
+    __m128 q_hi_f = _mm_div_ps(_mm_cvtepi32_ps(a_hi32),
+                               _mm_cvtepi32_ps(b_hi32));
+
+    q_lo_f = _mm_round_ps(q_lo_f, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
+    q_hi_f = _mm_round_ps(q_hi_f, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
+
+    __m128i q_lo32 = _mm_cvttps_epi32(q_lo_f);
+    __m128i q_hi32 = _mm_cvttps_epi32(q_hi_f);
+
+    // 3. r = a – q*b   (now guaranteed 0 ≤ r < b)
+    __m128i r_lo32 = _mm_sub_epi32(a_lo32, _mm_mullo_epi32(q_lo32, b_lo32));
+    __m128i r_hi32 = _mm_sub_epi32(a_hi32, _mm_mullo_epi32(q_hi32, b_hi32));
+
+    // 4. Pack back to 8×i16 and return
+    return _mm_packs_epi32(r_lo32, r_hi32);
+}
+
+static void forward_RNS_avx(const int16_t *mat, int n,
+                        const uint8_t *moduli_set, int m,
+                        uint8_t *res_3D_mat)
+{
+    assert(m == 8); // this implementation only supports 8 moduli
+
+    // Load all 8 moduli as a __m128i vector
+    __m128i moduli = _mm_set_epi16(
+        moduli_set[7], moduli_set[6], moduli_set[5], moduli_set[4],
+        moduli_set[3], moduli_set[2], moduli_set[1], moduli_set[0]);
+
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            int16_t val = mat[IDX(i, j, n)];
+            __m128i a_vec = _mm_set1_epi16(val);
+
+            // Vectorized floored mod
+            __m128i res_vec = floored_mod_forward_vec(a_vec, moduli);
+
+            // Store to 3D matrix (res_3D_mat[k*(n*n) + i*n + j])
+            // Since m == 8, k in [0,7]
+            alignas(16) uint16_t tmp[8];
+            _mm_store_si128((__m128i*)tmp, res_vec);
+
+            for (int k = 0; k < 8; ++k) {
+                res_3D_mat[IDX_3D(i, j, k, n)] = static_cast<uint8_t>(tmp[k]);
+            }
+        }
+    }
+}
+
+
+static void RNS_MMM_vec(const uint8_t *mat_A_3D, const uint8_t *mat_B_3D,
+                    int n, int m, const uint8_t *moduli_set, uint8_t *res_3D_mat)
+{
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            __m256i acc = _mm256_setzero_si256();  // 8-lane uint32_t accumulator
+
+            for (int l = 0; l < n; ++l) {
+                // Load 8 elements (one from each of 8 moduli planes)
+                alignas(32) uint32_t a_vec[8], b_vec[8];
+
+                for (int k = 0; k < 8; ++k) {
+                    a_vec[k] = mat_A_3D[IDX_3D(i, l, k, n)];
+                    b_vec[k] = mat_B_3D[IDX_3D(l, j, k, n)];
+                }
+
+                __m256i a = _mm256_load_si256((__m256i*)a_vec);
+                __m256i b = _mm256_load_si256((__m256i*)b_vec);
+                __m256i prod = _mm256_mullo_epi32(a, b);
+                acc = _mm256_add_epi32(acc, prod);
+            }
+
+            // Now apply modulus to each lane with moduli_set
+            alignas(32) uint32_t acc_vals[8];
+            _mm256_store_si256((__m256i*)acc_vals, acc);
+
+            for (int k = 0; k < 8; ++k) {
+                uint32_t sum = acc_vals[k];
+                uint8_t mod = moduli_set[k];
+                res_3D_mat[IDX_3D(i, j, k, n)] = static_cast<uint8_t>(sum % mod);
+            }
+        }
+    }
 }
